@@ -1,0 +1,8 @@
+.env
+/data
+/output
+skipped_culprits.txt
+error_logs.txt
+.vscode
+.venv
+__pycache__
