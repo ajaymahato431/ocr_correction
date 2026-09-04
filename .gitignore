@@ -1,8 +1,47 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .env
-/data
-/output
-skipped_culprits.txt
-error_logs.txt
-.vscode
 .venv
-__pycache__
+env/
+venv/
+ENV/
+
+# Environment variables
+.env*.local
+.env.*
+!.env.example
+
+# Runtime data & output
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+*.docx
+*.pdf
+
+# Logs and error outputs
+error_logs.txt
+skipped_culprits.txt
+*.log
+
+# IDEs and editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini

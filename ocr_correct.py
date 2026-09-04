@@ -5,41 +5,59 @@ Includes: Anti-loop penalties, Pre-cleaning, Multi-threading,
           Adaptive chunking, Output validation, and ZWNJ stripping.
 """
 
-import os
-import re
-import time
+import argparse
 import datetime
-import traceback
-import sys
+import os
 from pathlib import Path
-from dotenv import load_dotenv
+import re
+import sys
+import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import tiktoken
+from typing import Optional, Sequence, Union
 
-from openai import OpenAI, RateLimitError
 from docx import Document
-from docx.shared import Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches
+from dotenv import load_dotenv
+from openai import OpenAI, RateLimitError
+import tiktoken
 
 # ──────────────────────────────────────────────────────────────────
 # 1. CONFIGURATION
 # ──────────────────────────────────────────────────────────────────
 stop_execution = False
 SCRIPT_DIR = Path(__file__).resolve().parent
-ERROR_LOG_PATH = SCRIPT_DIR / "error_logs.txt"
-CULPRIT_LOG_PATH = SCRIPT_DIR / "skipped_culprits.txt"
 load_dotenv()
+
+ERROR_LOG_PATH = Path(os.getenv("ERROR_LOG_PATH", SCRIPT_DIR / "error_logs.txt"))
+CULPRIT_LOG_PATH = Path(os.getenv("CULPRIT_LOG_PATH", SCRIPT_DIR / "skipped_culprits.txt"))
+
+INPUT_DIR_DEFAULT = os.getenv("INPUT_DIR", "data")
+OUTPUT_DIR_DEFAULT = os.getenv("OUTPUT_DIR", "output")
+DEFAULT_API_PROVIDER = os.getenv("DEFAULT_API_PROVIDER", "deepseek").strip().lower()
+
+# ── Concurrency & Chunk Sizing Defaults ──
+MAX_WORKERS_DEFAULT = int(os.getenv("MAX_WORKERS", "5"))
+MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "1500"))
+HARD_CHAR_LIMIT = int(os.getenv("HARD_CHAR_LIMIT", "2000"))
+
+# ── Output Token Limits ──
+TOKENS_PER_CHAR = int(os.getenv("TOKENS_PER_CHAR", "5"))
+OUTPUT_HEADROOM = float(os.getenv("OUTPUT_HEADROOM", "2.0"))
+MIN_OUTPUT_TOKENS = 64
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
 
 API_PROVIDERS = {
     "deepseek": {
         "api_key_env": "DEEPSEEK_API_KEY",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     },
     "freemodel": {
         "api_key_env": "FREEMODEL_API_KEY",
-        "base_url": "https://api.freemodel.dev/v1",
-        "model": "gpt-4o",
+        "base_url": os.getenv("FREEMODEL_BASE_URL", "https://api.freemodel.dev/v1"),
+        "model": os.getenv("FREEMODEL_MODEL", "gpt-4o"),
     },
 }
 API_PROVIDER_ALIASES = {
@@ -57,14 +75,15 @@ MODEL_NAME = None
 API_PROVIDER_NAME = None
 
 
-def configure_api_client():
+def configure_api_client(provider_name: Optional[str] = None, interactive: bool = True):
     """
-    Ask for the API provider at startup, using DEFAULT_API_PROVIDER from .env
-    when Enter is pressed or no interactive input is available.
+    Configure the OpenAI client.
+    Uses provider_name if specified; otherwise prompts interactively if running in a TTY,
+    or falls back to DEFAULT_API_PROVIDER from .env.
     """
     global client, MODEL_NAME, API_PROVIDER_NAME
 
-    default_provider = os.getenv("DEFAULT_API_PROVIDER", "deepseek").strip().lower()
+    default_provider = DEFAULT_API_PROVIDER
     default_provider = API_PROVIDER_ALIASES.get(default_provider, default_provider)
     if default_provider not in API_PROVIDERS:
         print(
@@ -73,37 +92,50 @@ def configure_api_client():
         )
         default_provider = "deepseek"
 
-    print("Choose API provider:")
-    print("  1. deepseek")
-    print("  2. freemodel")
-    try:
-        selected = input(
-            f"API provider [default: {default_provider}]: "
-        ).strip().lower()
-    except EOFError:
-        selected = ""
+    selected_provider = provider_name
+    if not selected_provider and interactive and sys.stdin.isatty():
+        print("Choose API provider:")
+        print("  1. deepseek")
+        print("  2. freemodel")
+        try:
+            selected = input(
+                f"API provider [default: {default_provider}]: "
+            ).strip().lower()
+        except EOFError:
+            selected = ""
+        selected_provider = API_PROVIDER_ALIASES.get(selected, selected) if selected else default_provider
+        while selected_provider not in API_PROVIDERS:
+            print("Invalid provider. Enter 1/deepseek or 2/freemodel.")
+            try:
+                selected = input(
+                    f"API provider [default: {default_provider}]: "
+                ).strip().lower()
+            except EOFError:
+                selected = ""
+            selected_provider = API_PROVIDER_ALIASES.get(selected, selected) if selected else default_provider
+    elif not selected_provider:
+        selected_provider = default_provider
+    else:
+        selected_provider = API_PROVIDER_ALIASES.get(selected_provider.lower(), selected_provider.lower())
 
-    provider_name = API_PROVIDER_ALIASES.get(selected, selected) if selected else default_provider
-    while provider_name not in API_PROVIDERS:
-        print("Invalid provider. Enter 1/deepseek or 2/freemodel.")
-        selected = input(
-            f"API provider [default: {default_provider}]: "
-        ).strip().lower()
-        provider_name = API_PROVIDER_ALIASES.get(selected, selected) if selected else default_provider
+    if selected_provider not in API_PROVIDERS:
+        print(f"Error: Unknown provider '{selected_provider}'. Available: {list(API_PROVIDERS.keys())}")
+        sys.exit(1)
 
-    provider = API_PROVIDERS[provider_name]
+    provider = API_PROVIDERS[selected_provider]
     api_key_env = provider["api_key_env"]
     api_key = os.getenv(api_key_env)
     if not api_key:
-        print(f"Error: {api_key_env} not found in .env file.")
-        exit(1)
+        print(f"Error: {api_key_env} not found in environment or .env file.")
+        print(f"Please copy .env.example to .env and set your {api_key_env}.")
+        sys.exit(1)
 
     client = OpenAI(
         api_key=api_key,
         base_url=provider["base_url"],
     )
     MODEL_NAME = provider["model"]
-    API_PROVIDER_NAME = provider_name
+    API_PROVIDER_NAME = selected_provider
 
 # ── Chunk sizing ──
 # As per recommendation, chunk by standard characters and natural breaks.
@@ -883,13 +915,23 @@ def build_corrected_docx(text, original_filename, output_folder):
 # ──────────────────────────────────────────────────────────────────
 # 11. MAIN PROCESSING LOOP (MULTI-THREADED)
 # ──────────────────────────────────────────────────────────────────
-def process_directory(input_folder, output_folder):
+def process_directory(
+    input_folder: Union[str, Path] = INPUT_DIR_DEFAULT,
+    output_folder: Union[str, Path] = OUTPUT_DIR_DEFAULT,
+    max_workers: int = MAX_WORKERS_DEFAULT,
+    max_chunk_chars: int = MAX_CHUNK_CHARS,
+    hard_char_limit: int = HARD_CHAR_LIMIT,
+):
     global stop_execution
     input_dir = Path(input_folder)
     if not input_dir.exists():
+        print(f"Warning: Input folder '{input_dir}' does not exist.")
         return
 
     docx_files = sorted(input_dir.glob("*.docx"))
+    if not docx_files:
+        print(f"No .docx files found in '{input_dir.resolve()}'.")
+        return
 
     for file_idx, filepath in enumerate(docx_files, 1):
         if stop_execution:
@@ -902,25 +944,24 @@ def process_directory(input_folder, output_folder):
 
         raw_text = extract_text_from_docx(str(filepath))
         cleaned_text = clean_ocr_text(raw_text)
-        chunks = smart_chunk(cleaned_text, max_chars=MAX_CHUNK_CHARS)
+        chunks = smart_chunk(cleaned_text, max_chars=max_chunk_chars)
 
         # Report chunk stats
         chunk_sizes = [len(c) for c in chunks]
-        oversized = sum(1 for s in chunk_sizes if s > HARD_CHAR_LIMIT)
+        oversized = sum(1 for s in chunk_sizes if s > hard_char_limit)
         print(
             f"  📄 {len(chunks)} chunks. "
             f"min={min(chunk_sizes)}, max={max(chunk_sizes)}, "
             f"avg={sum(chunk_sizes) // len(chunk_sizes)} chars"
         )
         if oversized:
-            print(f"  ⚠️  {oversized} chunks exceed hard limit of {HARD_CHAR_LIMIT}!")
+            print(f"  ⚠️  {oversized} chunks exceed hard limit of {hard_char_limit}!")
         print("  🚀 Starting Parallel Processing...\n")
 
         corrected_chunks_dict = {}
-        MAX_WORKERS = 5
 
         try:
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(generate_corrected_text, chunk, filename, idx): idx
                     for idx, chunk in enumerate(chunks)
@@ -980,19 +1021,93 @@ def process_directory(input_folder, output_folder):
         print(f"\n  🎉 Saved: {out_path}\n")
 
 
-if __name__ == "__main__":
-    INPUT_FOLDER = "data"
-    OUTPUT_FOLDER = "output"
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Nepali Legal OCR Correction Pipeline using OpenAI-compatible LLMs."
+    )
+    parser.add_argument(
+        "-i",
+        "--input-dir",
+        type=Path,
+        default=Path(INPUT_DIR_DEFAULT),
+        help=f"Input directory containing .docx documents (default: {INPUT_DIR_DEFAULT} or env INPUT_DIR).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        default=Path(OUTPUT_DIR_DEFAULT),
+        help=f"Output directory to save corrected .docx documents (default: {OUTPUT_DIR_DEFAULT} or env OUTPUT_DIR).",
+    )
+    parser.add_argument(
+        "-p",
+        "--provider",
+        type=str,
+        default=None,
+        help="API provider to use ('deepseek' or 'freemodel'). Defaults to interactive prompt or env DEFAULT_API_PROVIDER.",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=MAX_WORKERS_DEFAULT,
+        help=f"Number of parallel worker threads for LLM requests (default: {MAX_WORKERS_DEFAULT} or env MAX_WORKERS).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=MAX_CHUNK_CHARS,
+        help=f"Target character count per semantic chunk (default: {MAX_CHUNK_CHARS} or env MAX_CHUNK_CHARS).",
+    )
+    parser.add_argument(
+        "--hard-limit",
+        type=int,
+        default=HARD_CHAR_LIMIT,
+        help=f"Hard character limit per chunk ceiling (default: {HARD_CHAR_LIMIT} or env HARD_CHAR_LIMIT).",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run non-interactively, skipping provider prompt and using default from .env or CLI.",
+    )
+    return parser.parse_args(argv)
 
-    configure_api_client()
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+
+    is_interactive = not args.non_interactive and args.provider is None and sys.stdin.isatty()
+    configure_api_client(provider_name=args.provider, interactive=is_interactive)
 
     print("Starting Nepali Legal OCR Correction")
     print(f"  Provider: {API_PROVIDER_NAME} ({MODEL_NAME})")
     print(
-        f"  Config: chunk={MAX_CHUNK_CHARS}, hard_limit={HARD_CHAR_LIMIT}, "
+        f"  Config: chunk={args.chunk_size}, hard_limit={args.hard_limit}, "
         f"max_out={MAX_OUTPUT_TOKENS}, tok/char={TOKENS_PER_CHAR}, "
-        f"headroom={OUTPUT_HEADROOM}x"
+        f"headroom={OUTPUT_HEADROOM}x, workers={args.workers}"
     )
-    print(f"  Logs: {ERROR_LOG_PATH}")
+    print(f"  Input:    {args.input_dir.resolve()}")
+    print(f"  Output:   {args.output_dir.resolve()}")
+    print(f"  Logs:     {ERROR_LOG_PATH}")
     print(f"  Culprits: {CULPRIT_LOG_PATH}")
-    process_directory(INPUT_FOLDER, OUTPUT_FOLDER)
+
+    input_dir = args.input_dir
+    output_dir = args.output_dir
+    if not input_dir.exists():
+        print(f"\nCreating input directory: {input_dir}")
+        input_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Please place your Nepali legal .docx files in '{input_dir}' and rerun.")
+        return 0
+
+    process_directory(
+        input_folder=input_dir,
+        output_folder=output_dir,
+        max_workers=args.workers,
+        max_chunk_chars=args.chunk_size,
+        hard_char_limit=args.hard_limit,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

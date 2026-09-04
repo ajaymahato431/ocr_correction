@@ -128,8 +128,26 @@ def smart_chunk(text, max_chars=400):
 
 if __name__ == "__main__":
     import sys
+    from pathlib import Path
 
-    filepath = "data/Nepal Ko Sanbidhan.docx"
+    if len(sys.argv) > 1:
+        filepath = sys.argv[1]
+    else:
+        data_dir = Path("data")
+        docx_candidates = list(data_dir.glob("*.docx")) if data_dir.exists() else []
+        if docx_candidates:
+            filepath = str(docx_candidates[0])
+            print(f"No file argument provided. Auto-selected: {filepath}\n")
+        else:
+            print("Usage: python diagnose_chunks.py [path_to_docx]")
+            print("Notice: No .docx file specified and no .docx files found in 'data/' directory.")
+            print("Please place a .docx file in 'data/' or specify the file path as an argument.")
+            sys.exit(0)
+
+    if not Path(filepath).exists():
+        print(f"Error: File not found: {filepath}")
+        sys.exit(1)
+
     print(f"Analyzing: {filepath}\n")
 
     raw = extract_text_from_docx(filepath)

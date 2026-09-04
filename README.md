@@ -1,76 +1,196 @@
-# OCR Correction
+# Nepali Legal OCR Correction Pipeline
 
-A Python pipeline that corrects OCR errors in Nepali legal `.docx` documents using an OpenAI-compatible LLM API. It cleans scan artifacts, chunks documents along legal structure boundaries (दफा/धारा/भाग), sends each chunk to the model for correction, validates the output against hallucination/truncation patterns, and reassembles a formatted `.docx` with proper headings and indentation.
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![LLM: OpenAI Compatible](https://img.shields.io/badge/LLM-DeepSeek%20%7C%20OpenAI-brightgreen.svg)](https://platform.openai.com)
+[![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)](Dockerfile)
+[![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 
-## Features
+A high-performance, structure-aware pipeline designed to post-process and correct OCR errors in Nepali legal documents (`.docx`) using OpenAI-compatible Large Language Models (e.g., DeepSeek, GPT-4o). It automates scan artifact cleanup, legal hierarchy boundary chunking (दफा / उपदफा / खण्ड), parallelized LLM corrections with anti-hallucination validation, and reassembles perfectly formatted Microsoft Word documents.
 
-- **Pre-cleaning**: strips zero-width characters, smart quotes, watermark/URL noise, and other scan artifacts before chunking.
-- **Structure-aware chunking**: splits text on legal markers (दफा, धारा, भाग, परिच्छेद, अनुसूची, Schedule, Part, Section, Article) with a hard character ceiling and sentence/newline fallback splitting.
-- **Multi-threaded correction**: processes chunks in parallel via `ThreadPoolExecutor`, with a retry pass for chunks that fail.
-- **Output validation**: rejects and recursively re-splits chunks that come back truncated, empty, oversized, or repetitive (a known LLM hallucination pattern).
-- **Culprit sanitization**: detects individual characters/substrings that blow up token counts (bad OCR glyphs) and strips them before sending to the API, logging what was dropped.
-- **DOCX reconstruction**: rebuilds a `.docx` with headings for भाग/अनुसूची, bold titles for दफा, and indentation for उपदफा/खण्ड.
-- **Selectable API provider**: switch between configured OpenAI-compatible providers (DeepSeek, or a custom one) via `.env` or interactive prompt.
+---
 
-## Requirements
+## 🏗️ Architecture & Pipeline Flow
 
-- Python 3.9+
-- Dependencies in [requirements.txt](requirements.txt): `openai`, `python-docx`, `python-dotenv`, `tiktoken`
+Correcting Devanagari legal text poses unique challenges: conjunct consonants breakdown, zero-width characters that inflate token consumption, and hallucination loops. This pipeline addresses these issues systematically:
 
-## Setup
+```mermaid
+flowchart TD
+    A[Raw OCR .docx Input] --> B[Text Extraction]
+    B --> C[Sanitization & Normalization]
+    C -->|Strip ZWNJ U+200C, BOM, Smart Quotes, URLs| D[Structure-Aware Chunking]
+    
+    D -->|Split on Legal Markers: दफा, धारा, भाग| E[Size Enforcement & Sentence Splitting]
+    E -->|Guaranteed ≤ HARD_CHAR_LIMIT| F[Parallel Worker Pool - ThreadPoolExecutor]
+    
+    subgraph LLM Processing & Anti-Hallucination
+        F --> G[LLM Completion Call]
+        G --> H{Output Validation}
+        H -->|Repetition Loop / Truncation Detected?| I[Recursive Bisection & Retry]
+        I --> G
+        H -->|Valid Corrected Nepali Text| J[Validated Chunk Dict]
+    end
+    
+    J --> K[Re-order Chunks Sequentially]
+    K --> L[Format Clauses: Bold Dafa Titles, Indent Upadafa & Khand]
+    L --> M[Export Formatted .docx]
+```
+
+### Key Engineering Features
+- **Zero-Width & Artifact Normalization**: Strips Zero-Width Non-Joiner (`\u200c`), ZWSP (`\u200b`), and watermark URLs that trigger tokenizer explosions.
+- **Structure-Aware Legal Chunking**: Preserves structural units (भाग, अध्याय, अनुसूची, दफा, धारा, उपदफा, खण्ड) with guaranteed upper character ceilings (`HARD_CHAR_LIMIT`).
+- **Anti-Hallucination Guardrails**: Real-time validation checks for consecutive repeated line patterns and suspicious token expansion, recursively bisecting offending chunks.
+- **High-Throughput Concurrency**: Multi-threaded request pool with automatic exponential backoff and failed chunk retry passes.
+- **Hierarchical DOCX Reassembly**: Auto-formats headings, bold clause labels, and nested indents (0.3" for उपदफा, 0.6" for खण्ड).
+
+---
+
+## 📋 Prerequisites & Installation
+
+### Option A: Containerized Setup (Docker - Recommended)
 
 ```bash
-pip install -r requirements.txt
+# 1. Clone the repository
+git clone https://github.com/ajaymahato431/ocr_correction.git
+cd ocr_correction
+
+# 2. Configure environment
 cp .env.example .env
+# Edit .env and enter your DEEPSEEK_API_KEY
+
+# 3. Build Docker image
+docker build -t ocr-correction .
+
+# 4. Run batch correction (mount your local data and output folders)
+docker run --rm --env-file .env \
+  -v "${PWD}/data:/app/data" \
+  -v "${PWD}/output:/app/output" \
+  ocr-correction --non-interactive
 ```
 
-Edit `.env` and set your API key:
+---
 
-```
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
-DEFAULT_API_PROVIDER=deepseek
-```
+### Option B: Native Local Installation
 
-## Usage
-
-1. Place source `.docx` files in a `data/` folder in the project root.
-2. Run the script:
+#### 1. Python Environment Setup
 
 ```bash
+# Clone the repository
+git clone https://github.com/ajaymahato431/ocr_correction.git
+cd ocr_correction
+
+# Create virtual environment
+python -m venv venv
+
+# On Linux / macOS:
+source venv/bin/activate
+# On Windows PowerShell:
+.\venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+---
+
+## ⚙️ Configuration Guide
+
+1. **Create your `.env` file**:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Configure your API keys and provider**:
+   ```env
+   # Choose default provider: 'deepseek' or 'freemodel'
+   DEFAULT_API_PROVIDER=deepseek
+
+   # DeepSeek Settings (Recommended for cost & Nepali speed)
+   DEEPSEEK_API_KEY=sk-your-deepseek-api-key-here
+   DEEPSEEK_BASE_URL=https://api.deepseek.com
+   DEEPSEEK_MODEL=deepseek-v4-flash
+
+   # FreeModel / Custom OpenAI Settings
+   FREEMODEL_API_KEY=your_key_here
+   FREEMODEL_BASE_URL=https://api.freemodel.dev/v1
+   FREEMODEL_MODEL=gpt-4o
+
+   # Concurrency & Chunking
+   MAX_WORKERS=5
+   MAX_CHUNK_CHARS=1500
+   HARD_CHAR_LIMIT=2000
+   ```
+
+> **Configuration Precedence**:
+> `CLI Arguments` > `Environment Variables (.env)` > `Default Values`
+
+---
+
+## 🚀 Usage & CLI Reference
+
+### Basic Execution (Interactive Mode)
+```bash
+# Place your .docx files inside the 'data/' directory, then run:
 python ocr_correct.py
 ```
+If executed interactively in a terminal without flags, it will prompt you to select the LLM provider.
 
-3. Choose an API provider when prompted (or press Enter to use `DEFAULT_API_PROVIDER` from `.env`).
-4. Corrected files are written to `output/` as `<original_name>_corrected.docx`.
+### Non-Interactive / Automated Batch Execution
+```bash
+python ocr_correct.py --non-interactive -p deepseek -w 8 -i "data" -o "output"
+```
 
-Errors and skipped/unrecoverable text segments are logged to `error_logs.txt` and `skipped_culprits.txt` in the project root.
+### Full CLI Options Reference
 
-## Configuration
+| Option | Env Variable | Default Value | Description |
+| :--- | :--- | :--- | :--- |
+| `-i`, `--input-dir` | `INPUT_DIR` | `data` | Directory containing uncorrected `.docx` files. |
+| `-o`, `--output-dir` | `OUTPUT_DIR` | `output` | Directory where corrected `.docx` files are saved. |
+| `-p`, `--provider` | `DEFAULT_API_PROVIDER`| `deepseek` | API provider (`deepseek`, `freemodel`, or custom). |
+| `-w`, `--workers` | `MAX_WORKERS` | `5` | Number of concurrent worker threads. |
+| `--chunk-size` | `MAX_CHUNK_CHARS` | `1500` | Target character count per semantic chunk. |
+| `--hard-limit` | `HARD_CHAR_LIMIT` | `2000` | Hard upper ceiling per chunk before force splitting. |
+| `--non-interactive` | — | `False` | Run non-interactively using `.env` or CLI defaults. |
+| `-h`, `--help` | — | — | Show help message and exit. |
 
-Key constants at the top of [ocr_correct.py](ocr_correct.py):
+---
 
-| Constant | Purpose |
-|---|---|
-| `MAX_CHUNK_CHARS` | Target chunk size (default 1500 chars) |
-| `HARD_CHAR_LIMIT` | Absolute per-chunk ceiling (default 2000 chars) |
-| `MAX_OUTPUT_TOKENS` | Max tokens requested per API call (default 8192) |
-| `MAX_WORKERS` | Parallel API request threads (default 5) |
-| `API_PROVIDERS` | Provider name → API key env var, base URL, and model |
+## 🛠️ Diagnostics & Verification Utilities
 
-To add another OpenAI-compatible provider, add an entry to `API_PROVIDERS` in [ocr_correct.py](ocr_correct.py) with its own `api_key_env`, `base_url`, and `model`, plus a matching key in `.env`.
+The repository includes standalone diagnostic tools to inspect problematic documents and analyze chunk sizes before triggering API calls:
 
-## Helper scripts
+### 1. Diagnose Chunks & Character Anomalies (`diagnose_chunks.py`)
+Scans a target `.docx` file for abnormal Unicode characters, repeating patterns, and chunk distribution:
+```bash
+# Analyze a specific document
+python diagnose_chunks.py "data/sample_act.docx"
 
-- [diagnose_chunks.py](diagnose_chunks.py) — dumps chunk-by-chunk analysis (unusual characters, repetition patterns, size distribution) for a hardcoded input file, useful for debugging bad OCR input before a full run.
-- [verify_chunks.py](verify_chunks.py) — quick sanity check of chunk sizing and token estimates for a hardcoded input file after tuning the chunking constants.
+# Auto-detects the first .docx in data/ if no argument is provided
+python diagnose_chunks.py
+```
 
-Both scripts currently point at `data/Nepal Ko Sanbidhan.docx`; edit the `filepath` variable in each to point at a different file.
+### 2. Verify Chunk Sizing & Token Estimates (`verify_chunks.py`)
+Calculates token distributions and ensures no chunks exceed context windows:
+```bash
+python verify_chunks.py "data/sample_act.docx"
+```
 
-## How it works
+---
 
-1. **Extract**: paragraph text is pulled from the source `.docx`.
-2. **Clean**: `clean_ocr_text` normalizes characters and drops noise lines (page numbers, URLs, short non-Devanagari fragments).
-3. **Chunk**: `smart_chunk` splits on legal structure markers, merges small pieces up to `MAX_CHUNK_CHARS`, and force-splits anything over `HARD_CHAR_LIMIT`.
-4. **Correct**: each chunk is sent to the LLM with a system prompt tuned for Nepali legal OCR correction (preserves numbering hierarchy, punctuation, and wording; forbids paraphrasing/translation).
-5. **Validate**: `validate_output` checks output length ratio and repetition; invalid output is recursively bisected and retried until a clean segment is isolated or the culprit is skipped and logged.
-6. **Reassemble**: corrected chunks are joined, paragraph breaks are fixed, दफा/उपदफा/खण्ड boundaries are reformatted onto their own lines, and the result is rebuilt into a formatted `.docx`.
+## 🔧 Troubleshooting & FAQ
+
+### Q: `Error: DEEPSEEK_API_KEY not found in environment or .env file`
+- **Fix**: Copy `.env.example` to `.env` and verify your API key is correctly entered without extra spaces or quotes.
+
+### Q: `Tokens bloat or context length exceeded`
+- **Cause**: Some OCR scanned documents contain corrupted Devanagari Unicode sequences or non-standard fonts that generate excessive BPE tokens.
+- **Fix**: The script automatically detects and isolates culprit characters, saving them to `skipped_culprits.txt`. You can also lower `--chunk-size 1000 --hard-limit 1500` for highly corrupted scans.
+
+### Q: `How do I connect a local Ollama or vLLM instance?`
+- **Fix**: You can direct `FREEMODEL_BASE_URL` or a custom provider in `.env` to your local endpoint (e.g. `http://localhost:11434/v1`) with any placeholder key.
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
